@@ -1,0 +1,44 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.6.0
+torchvision==0.21.0
+opencv-python>=4.9.0.80
+diffusers==0.31.0
+transformers>=4.49.0
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio
+easydict
+ftfy
+dashscope
+imageio-ffmpeg
+numpy<2 # i changed from 1.24.4
+wandb
+omegaconf
+einops
+av==13.1.0
+opencv-python
+git+https://github.com/openai/CLIP.git
+open_clip_torch
+starlette
+pycocotools
+lmdb
+matplotlib
+sentencepiece
+pydantic==2.10.6
+scikit-image
+huggingface_hub[cli]
+dominate
+nvidia-tensorrt
+pycuda
+onnx
+onnxruntime
+h5py
+onnxscript
+onnxconverter_common
+flask
+flask-socketio
+torchao
+--extra-index-url https://pypi.ngc.nvidia.com
+
+flash_attn==2.7.4post1 # once this fails, use --no-build-isolation
