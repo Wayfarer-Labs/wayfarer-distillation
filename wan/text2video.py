@@ -281,12 +281,14 @@ class WanT2V:
             return None
         elif return_ode_distill_data:
             return {
-                "noise": noise[0],
+                "starting_noise": noise[0],
                 "velocity_cond": velocity_cond, # list[50] of [16,21,60,104]
                 "velocity_uncond": velocity_uncond, # list[50] of [16,21,60,104]
                 "accum_timesteps": accum_timesteps, # list[50] of [1]
                 "denoised_latents": latents[0], # [16,21,60,104]
-                "videos": videos[0]
+                "videos": videos[0],
+                "prompts_enc": context,
+                "prompts_enc_negative": context_null,
             }
         else:
             return videos[0]

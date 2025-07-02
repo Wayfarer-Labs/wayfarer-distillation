@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""swmr_monolith_writer.py ────────────────────────────────────────────────
-End‑to‑end **Self‑Forcing ODE pair** logger for WAN‑2.1‑T2V using a
-*monolithic* HDF5 layout **and** true SWMR.
-
-The design ➡ one dedicated **writer** process owns the HDF5 file; one
-worker process per GPU renders samples and pushes dictionaries through a
-`multiprocessing.Queue`.  This avoids the *"Cannot re‑initialize CUDA in
-forked subprocess"* pitfall:  CUDA is only touched *inside* the spawned
-workers, and the start method is forced to **spawn**.
-
-Usage (8 GPU node):
-```
-python swmr_monolith_writer.py \
-       --prompts prompts.txt \
-       --ckpt-dir /path/to/wan/checkpoints \
-       --out ode_pairs.h5 \
-       --cfg /path/to/config.py \
-       --gpus 8
-```
-The script auto‑detects shapes from the WAN config; edit the constants
-near the top if you switch resolution buckets.
-"""
-# ---------------------------------------------------------------------------
 from __future__ import annotations
 import argparse, os, sys, textwrap, time, json, math, gc
 import multiprocessing as mp
@@ -30,13 +6,13 @@ from typing import List, Dict, Any
 
 import h5py, numpy as np
 import torch
-
-# ---------------------------------------------------------------------------
-# WAN‑T2V imports – ensure PYTHONPATH contains the repo root or install as pkg
 from wan.configs import t2v_1_3B
 from wan.text2video import WanT2V
+
+# TODO For now
 def load_config(): return t2v_1_3B
-MAX_PROMPTS = 1_000
+MAX_PROMPTS = 10 # each prompt gives us 50 timesteps
+
 # ---------------------------------------------------------------------------
 # 1.  HDF5 helpers
 # ---------------------------------------------------------------------------
@@ -44,7 +20,7 @@ DT_STR   = h5py.string_dtype(encoding="utf-8")
 DT_META  = np.dtype([("seed", "<i8"), ("guidance", "<f4"),
                      ("gpu", "<i2"),  ("wall_ms", "<i4")])
 
-def _create_dsets(f: h5py.File, shapes: Dict[str, tuple[int, ...]]):
+def _create_datasets(f: h5py.File, shapes: Dict[str, tuple[int, ...]]):
     """Create extendible, chunked datasets the first time we open the file."""
     max_n = None  # unlimited along axis 0
 
@@ -70,27 +46,26 @@ def _create_dsets(f: h5py.File, shapes: Dict[str, tuple[int, ...]]):
 
 
 def _append_sample(f: h5py.File, idx: int, prompt: str, meta: np.ndarray,
+                   noise: np.ndarray,
                    lat: np.ndarray,
                    v_c: np.ndarray, v_u: np.ndarray,
                    steps: np.ndarray):
     """Write a single sample (no resize here – caller already resized)."""
-    f["prompts"][idx]       = prompt
-    f["sample_attrs"][idx]  = meta
-    f["latents"][idx]       = lat
-    f["velocity_cond"][idx] = v_c
-    f["velocity_uncond"][idx]= v_u
-    f["timesteps"][idx]     = steps
+    f["prompts"][idx]           = prompt
+    f["sample_attrs"][idx]      = meta
+    f["noise"][idx]             = noise
+    f["latents"][idx]           = lat
+    f["velocity_cond"][idx]     = v_c
+    f["velocity_uncond"][idx]   = v_u
+    f["timesteps"][idx]         = steps
 
-# ---------------------------------------------------------------------------
-# 2.  Multiprocessing workflow
-# ---------------------------------------------------------------------------
 
 def writer_proc(out_path: str, shapes: Dict[str, tuple[int, ...]],
                 queue: mp.Queue, n_workers: int):
     """Single process owning the HDF5 file (SWMR writer)."""
     with h5py.File(out_path, "a", libver="latest") as f:
         if "prompts" not in f:
-            _create_dsets(f, shapes)
+            _create_datasets(f, shapes)
         f.swmr_mode = True
 
         finished = 0
@@ -102,10 +77,10 @@ def writer_proc(out_path: str, shapes: Dict[str, tuple[int, ...]],
 
             prompt, attrs, tensors = item
             # tensors unpack
-            lat, v_c, v_u, steps = tensors
+            noise, lat, v_c, v_u, steps = tensors
             idx = f["latents"].shape[0]
             # resize all extendible datasets once
-            for ds in ("prompts", "sample_attrs", "latents",
+            for ds in ("prompts", "sample_attrs", "noise", "latents",
                        "velocity_cond", "velocity_uncond", "timesteps"):
                 f[ds].resize(idx+1, axis=0)
             _append_sample(f, idx, prompt, attrs, lat, v_c, v_u, steps)
@@ -142,6 +117,7 @@ def worker_proc(rank: int, args: argparse.Namespace,
         wall_ms = int((time.perf_counter() - t0) * 1000)
 
         # --------------  prepare numpy for HDF5  --------------
+        noise = sample["starting_noise"].float().cpu().numpy().astype(np.float32)
         lat = sample["denoised_latents"].float().cpu().numpy().astype(np.float32)
         v_c = np.stack([v.float().cpu().numpy().astype(np.float32)
                          for v in sample["velocity_cond"]])
@@ -151,10 +127,8 @@ def worker_proc(rank: int, args: argparse.Namespace,
 
         meta = np.array((0, 5.0, rank, wall_ms), dtype=DT_META)
 
-        queue.put((prompt, meta, (lat, v_c, v_u, steps)))
+        queue.put((prompt, meta, (noise, lat, v_c, v_u, steps)))
         print(f"[GPU {rank}] {i} / {len(shard)} prompts done")
-        # free GPU mem quickly
-        # del sample; torch.cuda.empty_cache(); gc.collect()
 
     queue.put(None)  # sentinel
     print(f"[GPU {rank}] done.")
@@ -176,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompts", default=pathlib.Path('filtered_text_prompts_16k.txt'), help="txt file – one prompt per line")
     p.add_argument("--ckpt-dir", default=pathlib.Path(BASE_DIR), help="WAN checkpoint directory")
     p.add_argument("--model-hf-path", default="Wan-AI/Wan2.1-T2V-1.3B", help="WAN model Hugging Face path")
-    p.add_argument("--out",       default=pathlib.Path('wayfarer_distillation/data/wan_ode_pairs.h5'), help="output HDF5 filename")
+    p.add_argument("--out",       default=pathlib.Path('wayfarer_distillation/data/new_wan_ode_pairs_1-3B.h5'), help="output HDF5 filename")
     p.add_argument("--gpus", type=int, default=8, help="#GPUs to use")
     return p.parse_args()
 

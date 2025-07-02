@@ -40,6 +40,7 @@ flask
 flask-socketio
 torchao
 datasets
+rotary-embedding-torch
 --extra-index-url https://pypi.ngc.nvidia.com
 
 flash_attn==2.7.4post1 # once this fails, use --no-build-isolation
