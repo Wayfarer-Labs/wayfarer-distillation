@@ -21,18 +21,24 @@ from wan.configs import t2v_1_3B, i2v_14B, t2v_14B, i2v_14B
 from wan.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wayfarer_distillation.configs import TransformerConfig
 
 class GameRFT_T2V(nn.Module):
-    def __init__(self, cfg,
+    def __init__(self, cfg: TransformerConfig,
                  vae: WanVAE,
-                 wan_config = t2v_1_3B, # bad design but used to distill
-                 backbone: Literal["uvit", "dit"] = "uvit"):
+                 wan_config = t2v_1_3B, # bad design but used to distill):
+                 device: torch.device = torch.device('cuda:0'),
+                 rank: int = 0):
         super().__init__()
-        
-        self.cfg = cfg
+        backbone = cfg.backbone
+        self.rank = rank
+        self.device = device
+        self.config: TransformerConfig = cfg
         self.wan_config = wan_config
         self.backbone = UViT(cfg) if backbone == "uvit" else DiT(cfg)
         self.vae = vae
+        self.param_dtype = t2v_1_3B.param_dtype
+        self.num_train_timesteps = t2v_1_3B.num_train_timesteps
         self.text_cond = TextConditioningEmbedding(
             in_dim=cfg.text_dim,           # e.g. 4096
             out_dim=cfg.d_model,
@@ -41,23 +47,20 @@ class GameRFT_T2V(nn.Module):
         self.t_embed = TimestepEmbedding(out_dim=cfg.d_model)
 
         self.proj_in  = nn.Linear(cfg.channels, cfg.d_model, bias=False)
-        self.pos_enc  = LearnedPosEnc(cfg.tokens_per_frame * cfg.n_frames,
-                                      cfg.d_model)
         self.proj_out = FinalLayer(None, cfg.d_model, cfg.channels) # TODO first argument is unused
 
     # ------------------------------------------------------------------
-    def velocity_fn(self, latents, ts, txt_tokens):
+    def velocity_fn(self, latents, ts, text_tokens):
         B, N, C, H, W = latents.shape
 
         # ----- cond vectors ------------------------------------------------
-        text_cond = self.text_cond(txt_tokens, n_frames=N)  # [B, N, d]
+        text_cond = self.text_cond(text_tokens, n_frames=N)  # [B, N, d]
         time_cond = self.t_embed(ts)                        # [B, N, d]
         cond = text_cond + time_cond                        # [B, N, d]
 
         # ----- rearrange video tokens -------------------------------------
         x = eo.rearrange(latents, "b n c h w -> b (n h w) c")     # [B, V, C]
         x = self.proj_in(x)
-        x = self.pos_enc(x)
 
         # ----- backbone ----------------------------------------------------
         eps = self.backbone(x, cond)                    # [B, V, d]
@@ -65,27 +68,23 @@ class GameRFT_T2V(nn.Module):
         eps = eo.rearrange(eps, "b (n h w) c -> b n c h w", n=N, h=H, w=W)
         return eps
 
+    def forward(self, latents, t, text_tokens):
+        return self.velocity_fn(latents, t, text_tokens)
+
     def generate(self,
                 starting_noise,
                 text_tokens, # [B, num_tokens, D=4096]
                 negative_tokens, # [B, num_tokens, D=4096],
-                size=(832, 480),
                 frame_num=81,
                 shift=5.0,
                 sample_solver='unipc',
                 sampling_steps=50,
                 guide_scale=5.0, 
                 seed=-1,
-                return_ode_distill_data=False):
+                return_ode_distill_data=False,
+                offload_model=True):
 
         F = frame_num
-        target_shape = (self.vae.model.z_dim, (F - 1) // self.wan_config.vae_stride[0] + 1,
-                        size[1] // self.wan_config.vae_stride[1],
-                        size[0] // self.wan_config.vae_stride[2])
-
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                            (self.wan_config.patch_size[1] * self.wan_config.patch_size[2]) *
-                            target_shape[1] / self.wan_config.sp_size) * self.wan_config.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
@@ -103,7 +102,7 @@ class GameRFT_T2V(nn.Module):
 
         no_sync = getattr(self, 'no_sync', noop_no_sync)
 
-        with torch.amp.autocast(dtype=self.param_dtype), no_sync():
+        with torch.amp.autocast(device_type='cuda', dtype=self.param_dtype), no_sync():
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -127,9 +126,6 @@ class GameRFT_T2V(nn.Module):
 
             latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
-
             velocity_cond = []
             velocity_uncond = []
             accum_timesteps = []
@@ -141,14 +137,14 @@ class GameRFT_T2V(nn.Module):
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                self.to(self.device)
+                noise_pred_cond = self.forward(
+                    latent_model_input, t=timestep, text_tokens=context)
+                noise_pred_uncond = self.forward(
+                    latent_model_input, t=timestep, text_tokens=context_null)
                 if return_ode_distill_data:
-                    velocity_cond.append(noise_pred_cond)
-                    velocity_uncond.append(noise_pred_uncond)
+                    velocity_cond.append(noise_pred_cond.cpu()) # -- offload
+                    velocity_uncond.append(noise_pred_uncond.cpu())
                     accum_timesteps.append(t)
 
                 noise_pred = noise_pred_uncond + guide_scale * (
@@ -160,16 +156,19 @@ class GameRFT_T2V(nn.Module):
                     latents[0].unsqueeze(0),
                     return_dict=False,
                     generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+                latents = temp_x0.squeeze(0)
 
-            x0 = latents
-            if self.rank == 0:
-                videos = self.vae.decode(x0)
+        if offload_model:
+            self.cpu()
 
-        if not return_ode_distill_data:
-            del noise, latents
-            del sample_scheduler
-    
+
+        del latents
+        del sample_scheduler
+
+        if offload_model:
+            gc.collect()
+            torch.cuda.synchronize()
+
         if dist.is_initialized():
             dist.barrier()
 
@@ -177,17 +176,12 @@ class GameRFT_T2V(nn.Module):
             return None
         elif return_ode_distill_data:
             return {
-                "starting_noise": noise[0],
-                "velocity_cond": velocity_cond, # list[50] of [16,21,60,104]
-                "velocity_uncond": velocity_uncond, # list[50] of [16,21,60,104]
+                "starting_noise": noise,
+                "velocity_cond": torch.stack(velocity_cond), # list[50] of [16,21,60,104]
+                "velocity_uncond": torch.stack(velocity_uncond), # list[50] of [16,21,60,104]
                 "accum_timesteps": accum_timesteps, # list[50] of [1]
-                "denoised_latents": latents[0], # [16,21,60,104]
-                "videos": videos[0],
-                "prompts_enc": context,
-                "prompts_enc_negative": context_null,
             }
-        else:
-            return videos[0]
+        else: return None
 
 
 if __name__ == "__main__":

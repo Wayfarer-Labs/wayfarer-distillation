@@ -1,20 +1,26 @@
 import os
+from copy import deepcopy
+import gc
 from torch.nn import Linear
 import wandb
 import torch
 from typing import TypedDict
 from torch.nn.parallel import DistributedDataParallel
+import torch.nn.functional as F
 import h5py
 import shutil
 import subprocess
 import time
+import einops as eo
 from wayfarer_distillation.train_utils  import Timer, barrier
 from wayfarer_distillation.ode_pair_dataset import make_loader, ODEPairDataset
 from wayfarer_distillation.models.gamerft_t2v import GameRFT_T2V
-from wayfarer_distillation.rft_t2v_sampler import TextToVideoRFT_Sampler
 from wan.configs import t2v_1_3B, i2v_14B, t2v_14B, i2v_14B
 from wan.configs.globals import BASE_DIR
 from wan.modules.t5 import T5EncoderModel
+from wan.modules.vae import WanVAE
+from wayfarer_distillation.configs import Config
+from wayfarer_distillation.train_utils import setup, cleanup
 
 def prefix(prefix: str, info: dict[str, float]) -> dict[str, float]:
     return {f'{prefix}{k}': v for k, v in info.items()}
@@ -30,30 +36,32 @@ class ODE_Pair_Batch(TypedDict):
     prompts_enc_negative: list[torch.Tensor]
 
 class Loss_ODE_Distillation(torch.nn.Module):
-    def __init__(self, student_model: GameRFT_T2V, guidance_scale: float = 5.0, apply_cfg: bool = True):
+    def __init__(self, apply_cfg: bool = True):
         super().__init__()
-        self.student_model = student_model
-        self.guidance_scale = guidance_scale
         self.apply_cfg = apply_cfg
     
     def forward(self,
-                student_velocity_cond: list[torch.Tensor],
-                student_velocity_uncond: list[torch.Tensor],
-                teacher_velocity_cond: list[torch.Tensor],
-                teacher_velocity_uncond: list[torch.Tensor]) -> torch.Tensor:
+                student_velocity_cond: torch.Tensor,
+                student_velocity_uncond: torch.Tensor,
+                teacher_velocity_cond: torch.Tensor,
+                teacher_velocity_uncond: torch.Tensor) -> torch.Tensor:
         return self._loss_ode(student_velocity_cond, student_velocity_uncond, teacher_velocity_cond, teacher_velocity_uncond)
 
     def _loss_ode(self,
-                student_velocity_cond: list[torch.Tensor],
-                student_velocity_uncond: list[torch.Tensor],
-                teacher_velocity_cond: list[torch.Tensor],
-                teacher_velocity_uncond: list[torch.Tensor]) -> torch.Tensor:
-        # TODO Some MSE
-        pass    
+                student_velocity_cond: torch.Tensor, # (b d) n c h w 
+                student_velocity_uncond: torch.Tensor, # (b d) n c h w
+                teacher_velocity_cond: torch.Tensor,
+                teacher_velocity_uncond: torch.Tensor) -> torch.Tensor:
+        loss_cond = F.mse_loss(student_velocity_cond,
+                               teacher_velocity_cond, reduction="mean")
+        loss_un   = F.mse_loss(student_velocity_uncond,
+                               teacher_velocity_uncond, reduction="mean")
+
+        return 0.5 * (loss_cond + loss_un)
 
 
 TRAIN_CONFIG = {
-    'batch_size': 8,
+    'batch_size': 1,
     'target_batch_size': 8,
     'cfg_scale': 5,
     'max_grad_norm': 1.0,
@@ -70,8 +78,8 @@ class ODE_Distillation_Trainer:
                 global_rank: int = 0,
                 local_rank:  int = 0,
                 world_size:  int = 1,
-                hdf5_path: str = '/mnt/data/ode_distillation_dataset/wan_ode_pairs.h5',
-                t5_cpu: bool = False,
+                hdf5_path: str = '/home/sky/wayfarer-distillation/wayfarer_distillation/data/new_wan_ode_pairs_1-3B.h5',
+                t5_cpu: bool = True,
                 offload_model: bool = True):
 
         # -- just cause i use a dbeugger and stopping would break things
@@ -99,20 +107,21 @@ class ODE_Distillation_Trainer:
             tokenizer_path=os.path.join(BASE_DIR, self.wan_config.t5_tokenizer),
             shard_fn=None)
 
+        for p in self.text_encoder.model.parameters():
+            p.requires_grad = False
+
         self.student_model_uvit = model_uvit.to(self.device)
         self.student_model_dit  = model_dit.to(self.device)
 
         if world_size > 1:
-            self.student_model = DistributedDataParallel(self.student_model, device_ids=[self.rank])
+            self.student_model_uvit = DistributedDataParallel(self.student_model_uvit, device_ids=[self.rank])
+            self.student_model_dit  = DistributedDataParallel(self.student_model_dit,  device_ids=[self.rank])
 
         # -- 
         self.train_steps    = 0
         self.max_steps      = self.train_config['distill_steps']
         self.log_interval   = self.train_config['log_interval']
         self.save_interval  = self.train_config['save_interval']
-
-        if self.rank == 0:
-            pass
 
         self.opt_vit = torch.optim.AdamW(self.student_model_uvit.parameters(), lr=self.train_config['lr'])
         self.opt_dit = torch.optim.AdamW(self.student_model_dit.parameters(), lr=self.train_config['lr'])
@@ -128,8 +137,7 @@ class ODE_Distillation_Trainer:
         self._loader = make_loader(hdf5_path, self.batch_size, num_workers=4, pin=True)
         self.dataset: ODEPairDataset = self._loader.dataset
         self.iter_loader = iter(self._loader)
-        self.sampler = TextToVideoRFT_Sampler(self.student_model)
-        self.loss_fn: Loss_ODE_Distillation = Loss_ODE_Distillation(student_model=self.student_model, guidance_scale=self.cfg_scale, apply_cfg=True)
+        self.loss_fn: Loss_ODE_Distillation = Loss_ODE_Distillation()
 
     @property
     def save_path(self):
@@ -176,15 +184,21 @@ class ODE_Distillation_Trainer:
             prompts_enc, prompts_enc_negative = self._encode_prompts(batch['prompts'])
             self.dataset.writeback_prompts(batch['index'], prompts_enc, prompts_enc_negative)
 
+        for k in ('starting_noise', 'latents'):
+            batch[k] = eo.rearrange(batch[k].to(self.device), 'b c n (h p1) (w p2) -> b n (p1 p2 c) h w', p1=4, p2=4) # deviating from wan for memory saving without sequence parallel
+
+        for k in ('velocity_cond', 'velocity_uncond'):
+            batch[k] = eo.rearrange(batch[k].to(self.device), 'b d c n (h p1) (w p2) -> b d n (p1 p2 c) h w', p1=4, p2=4)
+
         return ODE_Pair_Batch(
             starting_noise=batch['starting_noise'],
-            latents=batch['latents'],
-            velocity_cond=batch['velocity_cond'],
-            velocity_uncond=batch['velocity_uncond'],
-            timesteps=batch['timesteps'],
+            latents=batch['latents'].to(self.device),
+            velocity_cond=batch['velocity_cond'].to('cpu'),
+            velocity_uncond=batch['velocity_uncond'].to('cpu'),
+            timesteps=batch['timesteps'].to(self.device),
             prompts=batch['prompts'],
-            prompts_enc=self.dataset._ensure_padded(prompts_enc),
-            prompts_enc_negative=self.dataset._ensure_padded(prompts_enc_negative))
+            prompts_enc=self.dataset._ensure_padded(prompts_enc).to(self.device),
+            prompts_enc_negative=self.dataset._ensure_padded(prompts_enc_negative).to(self.device))
     
 
     def _optim_step(self, opt: torch.optim.Optimizer, scaler: torch.amp.GradScaler, loss: torch.Tensor) -> None:
@@ -194,6 +208,9 @@ class ODE_Distillation_Trainer:
         torch.nn.utils.clip_grad_norm_(self.student_model_uvit.parameters(), self.max_grad_norm)
         scaler.step(opt)
         scaler.update()
+        torch.cuda.empty_cache()          # releases cached arenas
+        gc.collect()                      # Python ref-counts
+
 
     def _train_step(self, model: GameRFT_T2V, opt: torch.optim.Optimizer, scaler: torch.amp.GradScaler) -> dict[str, float]:
         batch: ODE_Pair_Batch = self._format_batch()
@@ -202,15 +219,16 @@ class ODE_Distillation_Trainer:
             text_tokens=batch['prompts_enc'],
             negative_tokens=batch['prompts_enc_negative'],
             guide_scale=self.cfg_scale,
-            return_ode_distill_data=True
+            return_ode_distill_data=True,
+            offload_model=True
         )
 
         # TODO get velocities from student
-        loss = self.loss_fn.forward(
-            student_velocity_cond=fwd_info['velocity_cond'],
-            student_velocity_uncond=fwd_info['velocity_uncond'],
-            teacher_velocity_cond=batch['velocity_cond'],
-            teacher_velocity_uncond=batch['velocity_uncond']
+        loss = self.loss_fn.forward( # -- velcoties were offloaded so need to reload to device. 74490 before
+            student_velocity_cond=eo.rearrange(fwd_info['velocity_cond'].to(self.device), 'd b n c h w -> (b d) n c h w'),
+            student_velocity_uncond=eo.rearrange(fwd_info['velocity_uncond'].to(self.device), 'd b n c h w -> (b d) n c h w'),
+            teacher_velocity_cond=eo.rearrange(batch['velocity_cond'].to(self.device), 'b d n c h w -> (b d) n c h w'),
+            teacher_velocity_uncond=eo.rearrange(batch['velocity_uncond'].to(self.device), 'b d n c h w -> (b d) n c h w')
         )
 
         self._optim_step(opt, scaler, loss)
@@ -248,20 +266,23 @@ class ODE_Distillation_Trainer:
     def train(self) -> None:
         
         timer = Timer() ; s = timer.hit()
+        with self.ctx:
+            while self.should_train:
+                # half peak activations with this ? 
+                if self.train_steps % 2 == 0: info_vit = self._train_step(self.student_model_uvit, self.opt_vit, self.scaler_vit)
+                else:                         info_dit = self._train_step(self.student_model_dit,  self.opt_dit, self.scaler_dit)
+
+                if self.should_save: self._save_checkpoint() ; torch.cuda.empty_cache() ; e = timer.hit()
+
+                barrier()
+
+                if self.should_log:
+                    wandb.log(prefix('vit_', info_vit) | prefix('dit_', info_dit))
+                
+                self.train_steps += 1
         
-        while self.should_train:
-            info_vit = self._train_step(self.student_model_uvit, self.opt_vit, self.scaler_vit)
-            info_dit = self._train_step(self.student_model_dit,  self.opt_dit, self.scaler_dit)
-
-            if self.should_save: self._save_checkpoint() ; torch.cuda.empty_cache() ; e = timer.hit()
-
-            barrier()
-
-            if self.should_log:
-                wandb.log(prefix('vit_', info_vit) | prefix('dit_', info_dit))
-    
-        self._save_checkpoint()
-        print(f"Training complete in {self.train_steps} steps")
+            self._save_checkpoint()
+            print(f"Training complete in {self.train_steps} steps")
 
 
 def run_h5clear(path):
@@ -273,5 +294,18 @@ def run_h5clear(path):
 
 
 if __name__ == "__main__":
-    trainer = ODE_Distillation_Trainer()
+    from wan.configs.globals import BASE_DIR
+    global_rank, local_rank, world_size = setup()
+    device = f"cuda:{local_rank}"
+    vae = WanVAE(
+            vae_pth=os.path.join(BASE_DIR, t2v_1_3B.vae_checkpoint),
+            device=torch.device(device))
+    model_config_base = Config.from_yaml('basic.yml')
+    model_config_uvit = deepcopy(model_config_base)
+    model_config_dit  = deepcopy(model_config_base)
+    model_config_uvit.model.backbone = 'uvit'
+    model_config_dit.model.backbone = 'dit'
+    uvit = GameRFT_T2V(model_config_uvit.model, vae, wan_config=t2v_1_3B, device=device)
+    dit = GameRFT_T2V(model_config_dit.model, vae, wan_config=t2v_1_3B, device=device)
+    trainer = ODE_Distillation_Trainer(uvit, dit, global_rank, local_rank, world_size)
     trainer.train()

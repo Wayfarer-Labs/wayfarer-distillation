@@ -183,7 +183,7 @@ class WanT2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        noise = [
+        noise = [ # TODO Check what this is and compare to [B, 16, 21, 60, 104]
             torch.randn(
                 target_shape[0],
                 target_shape[1],

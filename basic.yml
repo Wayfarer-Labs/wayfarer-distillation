@@ -6,18 +6,20 @@ model:
   text_heads: 4
   model_id: game_rft_t2v
   sample_size: null # unused
-  channels: 128
+  channels: 256 # wanvae - move factor of patchsize from h and w into channel of 16 to get 16*ps^2 = 16*4
   
-  n_layers: 17
-  n_heads: 16
-  d_model: 1024
+  n_layers: 9
+  n_heads: 4
+  d_model: 128
 
-  tokens_per_frame: 16
+  tokens_per_frame: 390 # divide 60 by patchsize and 104 by patchsize,  from wanvae
   n_buttons: 11
   n_mouse_axes: 2
 
   cfg_prob: 0.1
   n_frames: 60
+  causal: false
+
 
 train:
   trainer_id: rft

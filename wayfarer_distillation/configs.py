@@ -1,7 +1,7 @@
 import yaml
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Literal
 
 @dataclass
 class TransformerConfig:
@@ -9,6 +9,10 @@ class TransformerConfig:
     channels : int = 128
     sample_size : int = 16
     patch_size : int = 1
+    backbone : Literal["uvit", "dit"] = "uvit"
+    text_dim : int = 4096
+    text_tokens : int = 512
+    text_heads : int = 4
 
     n_layers : int = 12
     n_heads : int = 12

@@ -11,7 +11,7 @@ from wan.text2video import WanT2V
 
 # TODO For now
 def load_config(): return t2v_1_3B
-MAX_PROMPTS = 10 # each prompt gives us 50 timesteps
+MAX_PROMPTS = 8 # each prompt gives us 50 timesteps
 
 # ---------------------------------------------------------------------------
 # 1.  HDF5 helpers
@@ -36,6 +36,11 @@ def _create_datasets(f: h5py.File, shapes: Dict[str, tuple[int, ...]]):
                      maxshape=(max_n,)+shapes["latents"], dtype="float32",
                      chunks=(1,)+shapes["latents"], compression="gzip")
 
+    f.create_dataset("noise", shape=(0,)+shapes["noise"],
+                     maxshape=(None,)+shapes["noise"],
+                     dtype="float32", chunks=(1,)+shapes["noise"],
+                     compression="gzip")
+
     for name in ("velocity_cond", "velocity_uncond"):
         f.create_dataset(name, shape=(0,)+shapes[name],
                          maxshape=(max_n,)+shapes[name], dtype="float32",
@@ -43,6 +48,8 @@ def _create_datasets(f: h5py.File, shapes: Dict[str, tuple[int, ...]]):
 
     f.create_dataset("timesteps", shape=(0, shapes["timesteps"][0]),
                      maxshape=(max_n, shapes["timesteps"][0]), dtype="int32")
+
+
 
 
 def _append_sample(f: h5py.File, idx: int, prompt: str, meta: np.ndarray,
@@ -83,7 +90,7 @@ def writer_proc(out_path: str, shapes: Dict[str, tuple[int, ...]],
             for ds in ("prompts", "sample_attrs", "noise", "latents",
                        "velocity_cond", "velocity_uncond", "timesteps"):
                 f[ds].resize(idx+1, axis=0)
-            _append_sample(f, idx, prompt, attrs, lat, v_c, v_u, steps)
+            _append_sample(f, idx, prompt, attrs, noise, lat, v_c, v_u, steps)
             f.flush()  # make visible to readers
 
         print("[writer] All workers done – closing file.")
@@ -147,7 +154,7 @@ def parse_args() -> argparse.Namespace:
         the file open; each GPU process streams its results through an
         inter‑process queue.
         """))
-    p.add_argument("--prompts", default=pathlib.Path('filtered_text_prompts_16k.txt'), help="txt file – one prompt per line")
+    p.add_argument("--prompts", default=pathlib.Path('/home/sky/wayfarer-distillation/wayfarer_distillation/data/filtered_text_prompts_16k.txt'), help="txt file – one prompt per line")
     p.add_argument("--ckpt-dir", default=pathlib.Path(BASE_DIR), help="WAN checkpoint directory")
     p.add_argument("--model-hf-path", default="Wan-AI/Wan2.1-T2V-1.3B", help="WAN model Hugging Face path")
     p.add_argument("--out",       default=pathlib.Path('wayfarer_distillation/data/new_wan_ode_pairs_1-3B.h5'), help="output HDF5 filename")
@@ -162,6 +169,7 @@ def infer_shapes(cfg) -> Dict[str, tuple[int, ...]]:
     H_lat, W_lat = 60, 104
     S            = 50
     return {
+        "noise"          : (C, F_lat, H_lat, W_lat),
         "latents"       : (C, F_lat, H_lat, W_lat),
         "velocity_cond" : (S, C, F_lat, H_lat, W_lat),
         "velocity_uncond":(S, C, F_lat, H_lat, W_lat),
